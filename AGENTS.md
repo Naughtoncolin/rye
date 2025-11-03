@@ -10,6 +10,7 @@
 - `chmod +x rye.R` once after cloning to ensure the launcher is executable on new environments.
 - `./rye.R -h` prints the optparse-driven help page and verifies required R packages load successfully.
 - `./rye.R --eigenvec=examples/example.eigenvec --eigenval=examples/example.eigenval --pop2group=examples/pop2group.txt --rounds=5 --threads=2 --iter=5 --out=smoke` runs the bundled smoke test and produces reference outputs under `smoke-*`.
+- `./rye.R ... --optimizer=gradient --grad-maxiter=50` switches the outer optimisation to the deterministic FISTA-based gradient loop; omit the flags to keep the legacy Gibbs annealing path.
 
 ## Coding Style & Naming Conventions
 - Follow the existing 2-space indentation, `{` on the same line, and space after commas style seen throughout `rye.R`.

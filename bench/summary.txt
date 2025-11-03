@@ -5,9 +5,9 @@ Residual 95th pct diff: 0.000495
 Mean L1 distance: 0.001722
 Median L1 distance: 0.000224
 Mean L2 distance: 0.000901
-Predict time (nnls) [s]: 0.279
-Predict time (fista) [s]: 0.212
-Predict speedup: 1.32x
+Predict time (nnls) [s]: 0.256
+Predict time (fista) [s]: 0.205
+Predict speedup: 1.25x
 Group mean abs diff:
 European 0.000085
 Asian 0.000222

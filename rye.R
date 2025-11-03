@@ -243,6 +243,42 @@ rye.predict = function(X = NULL, means = NULL, weight = NULL, referenceGroups = 
   return(estimates)
 }
 
+rye.prepareLossContext = function(X = NULL, fam = NULL, referenceGroups = NULL, alpha = NULL) {
+  pops = names(alpha)
+  if (is.null(referenceGroups)) {
+    referenceGroups = pops
+    names(referenceGroups) = pops
+  }
+  fam_ext = fam
+  group_col = referenceGroups[fam_ext[ , 'population']]
+  fam_ext = cbind(fam_ext, group_col)
+  colnames(fam_ext)[ncol(fam_ext)] = 'group'
+  group_levels = unique(referenceGroups)
+  expected = matrix(0, nrow = nrow(X), ncol = length(group_levels),
+                    dimnames = list(rownames(fam_ext), group_levels))
+  expected[cbind(fam_ext[ , 'id'], group_col)] = 1
+  list(X = X, fam = fam_ext, referenceGroups = referenceGroups,
+       expected = expected, pops = pops)
+}
+
+rye.evaluateLoss = function(alpha = NULL, weight = NULL, ctx = NULL, warm_starts = NULL,
+                            solver_iters = 300, solver_tol = 1e-6, solver_eta = NULL,
+                            solver_accel = TRUE, fallback_threshold = 1e-3) {
+  means = rye.populationMeans(X = ctx$X, fam = ctx$fam, alpha = alpha, weight = weight,
+                              referenceGroups = ctx$referenceGroups)[ctx$pops, , drop = FALSE]
+  predicted = rye.predict(X = ctx$X, means = means, weight = weight,
+                          referenceGroups = ctx$referenceGroups, warm_starts = warm_starts,
+                          solver_iters = solver_iters, solver_tol = solver_tol,
+                          solver_eta = solver_eta, solver_accel = solver_accel,
+                          fallback_threshold = fallback_threshold)
+  warm = attr(predicted, "raw_estimates")
+  err = (ctx$expected - predicted) ^ 2
+  err = rowMeans(err)
+  err = aggregate(err, by = list(ctx$fam[ , 'group']), mean)
+  loss = mean(err[ , 2])
+  list(loss = loss, means = means, predicted = predicted, warm_starts = warm)
+}
+
 ruye.squaredError = function(expected = NULL, predicted = NULL) {
   return((expected - predicted) ** 2)
 }
@@ -349,12 +385,184 @@ rye.gibbs = function(X = NULL, fam = NULL, referenceGroups = NULL,
 }
 
 
+rye.optimize.gradient = function(X = NULL, fam = NULL, referencePops = NULL,
+                                 referenceGroups = NULL, alpha = NULL, weight = NULL,
+                                 max_iter = 50, grad_tol = 1e-5, loss_tol = 1e-6,
+                                 step_init = 0.5, beta = 0.5, armijo_c = 1e-4,
+                                 fd_eps = 1e-5, project_simplex_weights = TRUE,
+                                 solver_iters = 300, solver_tol = 1e-6, solver_eta = NULL,
+                                 solver_accel = TRUE, fallback_threshold = 1e-3,
+                                 verbose = TRUE) {
+  ctx = rye.prepareLossContext(X = X, fam = fam, referenceGroups = referenceGroups,
+                               alpha = alpha)
+  current_eval = rye.evaluateLoss(alpha = alpha, weight = weight, ctx = ctx,
+                                  solver_iters = solver_iters, solver_tol = solver_tol,
+                                  solver_eta = solver_eta, solver_accel = solver_accel,
+                                  fallback_threshold = fallback_threshold)
+  current_loss = current_eval$loss
+  warm_starts = current_eval$warm_starts
+  best_loss = current_loss
+  best_state = list(alpha = alpha, weight = weight,
+                    means = current_eval$means, predicted = current_eval$predicted,
+                    warm_starts = warm_starts)
+  
+  for (iter in seq_len(max_iter)) {
+    grad_alpha = numeric(length(alpha))
+    names(grad_alpha) = names(alpha)
+    grad_weight = numeric(length(weight))
+    names(grad_weight) = names(weight)
+    
+    for (j in seq_along(alpha)) {
+      orig = alpha[j]
+      h = fd_eps * max(1, abs(orig))
+      if (h == 0) h = fd_eps
+      alpha[j] = orig + h
+      loss_plus = rye.evaluateLoss(alpha = alpha, weight = weight, ctx = ctx,
+                                   solver_iters = solver_iters, solver_tol = solver_tol,
+                                   solver_eta = solver_eta, solver_accel = solver_accel,
+                                   fallback_threshold = fallback_threshold)$loss
+      if (orig > h) {
+        alpha[j] = max(orig - h, 0)
+        loss_minus = rye.evaluateLoss(alpha = alpha, weight = weight, ctx = ctx,
+                                      solver_iters = solver_iters, solver_tol = solver_tol,
+                                      solver_eta = solver_eta, solver_accel = solver_accel,
+                                      fallback_threshold = fallback_threshold)$loss
+        grad_alpha[j] = (loss_plus - loss_minus) / (2 * h)
+      } else {
+        grad_alpha[j] = (loss_plus - current_loss) / h
+      }
+      alpha[j] = orig
+    }
+    
+    for (j in seq_along(weight)) {
+      orig = weight[j]
+      h = fd_eps * max(1, abs(orig))
+      if (h == 0) h = fd_eps
+      weight[j] = orig + h
+      loss_plus = rye.evaluateLoss(alpha = alpha, weight = weight, ctx = ctx,
+                                   solver_iters = solver_iters, solver_tol = solver_tol,
+                                   solver_eta = solver_eta, solver_accel = solver_accel,
+                                   fallback_threshold = fallback_threshold)$loss
+      if (orig > h) {
+        weight[j] = max(orig - h, 0)
+        loss_minus = rye.evaluateLoss(alpha = alpha, weight = weight, ctx = ctx,
+                                      solver_iters = solver_iters, solver_tol = solver_tol,
+                                      solver_eta = solver_eta, solver_accel = solver_accel,
+                                      fallback_threshold = fallback_threshold)$loss
+        grad_weight[j] = (loss_plus - loss_minus) / (2 * h)
+      } else {
+        grad_weight[j] = (loss_plus - current_loss) / h
+      }
+      weight[j] = orig
+    }
+    
+    grad_norm = max(abs(c(grad_alpha, grad_weight)))
+    if (grad_norm < grad_tol) {
+      if (verbose) progressmsg(paste0('Gradient optimizer converged (norm ', sprintf('%.3e', grad_norm), ') at iteration ', iter))
+      break
+    }
+    
+    dir_alpha = -grad_alpha
+    dir_weight = -grad_weight
+    directional_deriv = sum(grad_alpha * dir_alpha) + sum(grad_weight * dir_weight)
+    
+    step = step_init
+    accepted = FALSE
+    backtracks = 0
+    while (step >= 1e-8) {
+      trial_alpha = alpha + step * dir_alpha
+      trial_alpha[trial_alpha < 0] = 0
+      trial_weight = weight + step * dir_weight
+      trial_weight[trial_weight < 0] = 0
+      if (project_simplex_weights) {
+        trial_weight = proj_simplex(trial_weight)
+      }
+      trial_eval = rye.evaluateLoss(alpha = trial_alpha, weight = trial_weight, ctx = ctx,
+                                    solver_iters = solver_iters, solver_tol = solver_tol,
+                                    solver_eta = solver_eta, solver_accel = solver_accel,
+                                    fallback_threshold = fallback_threshold)
+      trial_loss = trial_eval$loss
+      target = current_loss + armijo_c * step * directional_deriv
+      if (directional_deriv >= -1e-12) {
+        target = current_loss - 1e-8
+      }
+      if (trial_loss <= target) {
+        alpha = trial_alpha
+        weight = trial_weight
+        current_loss = trial_loss
+        warm_starts = trial_eval$warm_starts
+        current_eval = trial_eval
+        if (trial_loss < best_loss) {
+          best_loss = trial_loss
+          best_state = list(alpha = alpha, weight = weight,
+                            means = trial_eval$means, predicted = trial_eval$predicted,
+                            warm_starts = warm_starts)
+        }
+        accepted = TRUE
+        break
+      } else {
+        step = step * beta
+        backtracks = backtracks + 1
+      }
+    }
+    
+    if (!accepted) {
+      if (verbose) progressmsg(paste0('Gradient optimizer terminated after iteration ', iter - 1, ' (no improving step)'))
+      break
+    } else if (verbose) {
+      progressmsg(paste0('Gradient iteration ', iter, ' loss: ', sprintf('%.6f', current_loss),
+                         ' (backtracks: ', backtracks, ')'))
+    }
+    
+    loss_delta = abs(best_loss - current_loss) / max(1, abs(current_loss))
+    if (loss_delta < loss_tol) {
+      if (verbose) progressmsg(paste0('Gradient optimizer loss change below threshold (', sprintf('%.3e', loss_delta), ')'))
+      break
+    }
+  }
+  
+  abs_err = rye.absoluteError(expected = ctx$expected, predicted = best_state$predicted)
+  abs_err = cbind(rowMeans(abs_err))
+  abs_err = aggregate(abs_err, by = list(ctx$fam[ , 'group']), mean)
+  final_error = mean(abs_err[ , 2])
+  list(final_error, best_state$alpha, best_state$weight,
+       best_state$means, best_state$predicted)
+}
+
+
 rye.optimize = function(X = NULL, fam = NULL,
                         referencePops = NULL, referenceGroups = NULL,
                         alpha = NULL, optimizeAlpha = TRUE,
                         weight = NULL, optimizeWeight = TRUE, attempts = 4,
                         iterations = 100, rounds = 25, threads = 1, startSD = 0.005, endSD = 0.001,
-                        populationError = FALSE) {
+                        populationError = FALSE, early_stop_patience = 0,
+                        optimizer = c('gibbs', 'gradient'),
+                        grad_max_iter = 50, grad_tol = 1e-5, grad_loss_tol = 1e-6,
+                        grad_step = 1, grad_beta = 0.5, grad_armijo_c = 1e-4,
+                        grad_fd_eps = 1e-5, grad_simplex = TRUE) {
+  
+  optimizer = match.arg(optimizer)
+  
+  if (optimizer == 'gradient') {
+    referenceFAM = fam[fam[ , 'population'] %in% referencePops , ]
+    referenceX = X[rownames(referenceFAM), ]
+    if (is.null(alpha)) {
+      alpha = rep(0.001, length(referencePops))
+    }
+    names(alpha) = referencePops
+    if (is.null(weight)) {
+      weight = 1 / seq(ncol(X))
+    }
+    return(rye.optimize.gradient(X = referenceX, fam = referenceFAM,
+                                 referencePops = referencePops,
+                                 referenceGroups = referenceGroups,
+                                 alpha = alpha, weight = weight,
+                                 max_iter = grad_max_iter, grad_tol = grad_tol,
+                                 loss_tol = grad_loss_tol, step_init = grad_step,
+                                 beta = grad_beta, armijo_c = grad_armijo_c,
+                                 fd_eps = grad_fd_eps,
+                                 project_simplex_weights = grad_simplex))
+  }
   
   ## Pull out the reference PCs
   referenceFAM = fam[fam[ , 'population'] %in% referencePops , ]
@@ -373,6 +581,8 @@ rye.optimize = function(X = NULL, fam = NULL,
   
   allErrors = c()
   
+  best_error_so_far = Inf
+  no_improve_rounds = 0
   for (round in seq(rounds)) {
     
     sd = startSD - (startSD - endSD) * log(round)/log(rounds)
@@ -402,8 +612,18 @@ rye.optimize = function(X = NULL, fam = NULL,
     
     allErrors = c(allErrors, errors[bestError])
     
-    ## See if our error hasn't decreased substantially in 5 rounds
-    if (round > 5) {
+    if (errors[bestError] < best_error_so_far - 1e-9) {
+      best_error_so_far = errors[bestError]
+      no_improve_rounds = 0
+    } else {
+      no_improve_rounds = no_improve_rounds + 1
+      if (early_stop_patience > 0 && no_improve_rounds >= early_stop_patience) {
+        progressmsg(paste0('Early stopping after ', round, ' rounds; best error: ', sprintf('%.6f', best_error_so_far)))
+        break
+      }
+    }
+    
+    if (early_stop_patience == 0 && round > 5) {
       errorChange = allErrors[(round - 5):round]
       errorChange = max(errorChange) - min(errorChange)
       if (errorChange <= 0.000025) {
@@ -419,7 +639,10 @@ rye.optimize = function(X = NULL, fam = NULL,
 rye = function(eigenvec_file = NULL, eigenval_file = NULL,
                pop2group_file = NULL, output_file = NULL,
                threads = 4, pcs = 20, optim_rounds = 200,
-               optim_iter = 100, attempts=4){
+               optim_iter = 100, attempts=4, optim_patience = 0,
+               optimizer = 'gibbs', grad_max_iter = 50, grad_tol = 1e-5,
+               grad_loss_tol = 1e-6, grad_step = 0.5, grad_beta = 0.5,
+               grad_armijo_c = 1e-4, grad_fd_eps = 1e-5, grad_simplex = TRUE){
   ## Perform core operation
   #TODO: Change file reading method to data.table
   logmsg("Reading in Eigenvector file")
@@ -468,7 +691,13 @@ rye = function(eigenvec_file = NULL, eigenval_file = NULL,
                            threads = threads, iterations = optim_iter,
                            rounds = optim_rounds, attempts=attempts,
                            weight = scaledWeight, alpha = unifAlpha, 
-                           optimizeWeight = TRUE, optimizeAlpha = TRUE)
+                           optimizeWeight = TRUE, optimizeAlpha = TRUE,
+                           early_stop_patience = optim_patience,
+                           optimizer = optimizer, grad_max_iter = grad_max_iter,
+                           grad_tol = grad_tol, grad_loss_tol = grad_loss_tol,
+                           grad_step = grad_step, grad_beta = grad_beta,
+                           grad_armijo_c = grad_armijo_c, grad_fd_eps = grad_fd_eps,
+                           grad_simplex = grad_simplex)
   optWeight = optParams[[3]]
   optMeans = optParams[[4]]
   
@@ -566,7 +795,25 @@ if (sys.nframe() == 0) {
                 help = 'Number of iterations to use for optimization (higher number = more accurate but slower; Default=100)',
                 metavar = '<optim-iters>'),
     make_option('--attempts', type = 'numeric', default = 4,
-                help = 'Number of attempts to find the optimum values (Default = 4)', metavar = '<ATTEMPTS>')
+                help = 'Number of attempts to find the optimum values (Default = 4)', metavar = '<ATTEMPTS>'),
+    make_option('--stop-patience', type = 'integer', default = 0,
+                help = 'Early-stop rounds without improvement (0 = disabled)', metavar = '<ROUNDS>'),
+    make_option('--optimizer', type = 'character', default = 'gibbs',
+                help = 'Outer optimizer: gibbs (default) or gradient', metavar = '<OPTIMIZER>'),
+    make_option('--grad-maxiter', type = 'integer', default = 50,
+                help = 'Maximum iterations for gradient optimizer (default = 50)', metavar = '<ITER>'),
+    make_option('--grad-tol', type = 'numeric', default = 1e-5,
+                help = 'Gradient infinity-norm tolerance (default = 1e-5)', metavar = '<TOL>'),
+    make_option('--grad-loss-tol', type = 'numeric', default = 1e-6,
+                help = 'Relative loss tolerance for gradient optimizer (default = 1e-6)', metavar = '<TOL>'),
+    make_option('--grad-step', type = 'numeric', default = 0.5,
+                help = 'Initial step size for gradient optimizer (default = 0.5)', metavar = '<STEP>'),
+    make_option('--grad-beta', type = 'numeric', default = 0.5,
+                help = 'Backtracking shrink factor beta (default = 0.5)', metavar = '<BETA>'),
+    make_option('--grad-eps', type = 'numeric', default = 1e-5,
+                help = 'Finite-difference epsilon (default = 1e-5)', metavar = '<EPS>'),
+    make_option('--grad-simplex', type = 'logical', default = TRUE,
+                help = 'Project gradient updates to the simplex for weights (default = TRUE)', metavar = '<TRUE/FALSE>')
   )
   
   optParser = OptionParser(option_list = optionList)
@@ -589,7 +836,16 @@ if (sys.nframe() == 0) {
       attempts = opt$attempts,
       pcs = opt$pcs,
       optim_rounds = opt$rounds,
-      optim_iter = opt$iter)
+      optim_iter = opt$iter,
+      optim_patience = opt[['stop-patience']],
+      optimizer = opt$optimizer,
+      grad_max_iter = opt[['grad-maxiter']],
+      grad_tol = opt[['grad-tol']],
+      grad_loss_tol = opt[['grad-loss-tol']],
+      grad_step = opt[['grad-step']],
+      grad_beta = opt[['grad-beta']],
+      grad_fd_eps = opt[['grad-eps']],
+      grad_simplex = isTRUE(opt[['grad-simplex']]))
   logmsg("Process completed")
   end_time <- difftime(Sys.time(), start_time, units = "secs")[[1]]
   #print(end_time)
