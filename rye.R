@@ -458,7 +458,7 @@ rye = function(eigenvec_file = NULL, eigenval_file = NULL,
   referencePops = referenceGroups
   
   ## Optimize estimates using NNLS
-  logmsg("Optimizing estimates using simplex PG solver")
+  logmsg("Optimizing estimates using FISTA-based NNLS solver")
   scaledWeight = weight[seq(pcs)]
   unifAlpha = rep(0.001, length(referencePops))
   names(unifAlpha) = referencePops

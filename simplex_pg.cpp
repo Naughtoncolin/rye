@@ -13,9 +13,8 @@ using namespace Rcpp;
 static inline void mat_vec(const double* G_ptr, const double* v, double* out, int m) {
   for (int i = 0; i < m; ++i) {
     double acc = 0.0;
-    const double* row = G_ptr + static_cast<std::size_t>(i);
     for (int j = 0; j < m; ++j) {
-      acc += row[static_cast<std::size_t>(j) * m] * v[j];
+      acc += G_ptr[i + static_cast<std::size_t>(j) * m] * v[j];
     }
     out[i] = acc;
   }
@@ -29,15 +28,41 @@ static inline double dot_product(const double* a, const double* b, int m) {
   return acc;
 }
 
-static inline double project_nonneg(double* v, int m) {
-  double sum = 0.0;
+static inline void project_simplex(double* v, int m) {
+  std::vector<double> u(m);
   for (int i = 0; i < m; ++i) {
-    if (v[i] < 0.0) {
-      v[i] = 0.0;
-    }
-    sum += v[i];
+    u[i] = v[i];
   }
-  return sum;
+  std::sort(u.begin(), u.end(), std::greater<double>());
+  double cssv = 0.0;
+  int rho = -1;
+  for (int i = 0; i < m; ++i) {
+    cssv += u[i];
+    double t = (cssv - 1.0) / static_cast<double>(i + 1);
+    if (u[i] - t > 0.0) {
+      rho = i;
+    }
+  }
+  double theta = (cssv - 1.0) / static_cast<double>(rho + 1);
+  double sum_w = 0.0;
+  for (int i = 0; i < m; ++i) {
+    double val = v[i] - theta;
+    if (val < 0.0) {
+      val = 0.0;
+    }
+    v[i] = val;
+    sum_w += val;
+  }
+  if (sum_w <= 1e-12) {
+    double uniform = 1.0 / static_cast<double>(m);
+    for (int i = 0; i < m; ++i) {
+      v[i] = uniform;
+    }
+  } else if (std::abs(sum_w - 1.0) > 1e-8) {
+    for (int i = 0; i < m; ++i) {
+      v[i] /= sum_w;
+    }
+  }
 }
 
 // [[Rcpp::export]]
@@ -68,7 +93,7 @@ List fista_nnls_batch_cpp(const NumericMatrix& G,
   if (!std::isfinite(eta) || eta <= 0.0) {
     double trace = 0.0;
     for (int i = 0; i < m; ++i) {
-      trace += G_ptr[static_cast<std::size_t>(i) * (m + 1)];
+      trace += G_ptr[i + static_cast<std::size_t>(i) * m];
     }
     if (!std::isfinite(trace) || trace <= 0.0) {
       trace = 1.0;
@@ -76,11 +101,9 @@ List fista_nnls_batch_cpp(const NumericMatrix& G,
     eta = 1.0 / trace;
   }
 
-  const double uniform = 1.0 / static_cast<double>(m);
-
-  #ifdef _OPENMP
-  #pragma omp parallel for schedule(static)
-  #endif
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
   for (int sample = 0; sample < n; ++sample) {
     std::vector<double> atx(m);
     for (int i = 0; i < m; ++i) {
@@ -92,15 +115,9 @@ List fista_nnls_batch_cpp(const NumericMatrix& G,
       for (int i = 0; i < m; ++i) {
         w[i] = warm_ptr[static_cast<std::size_t>(sample) * m + i];
       }
-      double warm_sum = project_nonneg(w.data(), m);
-      if (warm_sum <= 1e-12) {
-        std::fill(w.begin(), w.end(), uniform);
-      } else {
-        for (int i = 0; i < m; ++i) {
-          w[i] /= warm_sum;
-        }
-      }
+      project_simplex(w.data(), m);
     } else {
+      double uniform = 1.0 / static_cast<double>(m);
       std::fill(w.begin(), w.end(), uniform);
     }
 
@@ -115,7 +132,7 @@ List fista_nnls_batch_cpp(const NumericMatrix& G,
     double t_k = 1.0;
     int iter_used = iters;
 
-    std::vector<double> grad(m), Gy(m), w_next(m), Gw_next(m);
+    std::vector<double> Gy(m), grad(m), w_next(m), Gw_next(m);
 
     for (int iter = 1; iter <= iters; ++iter) {
       mat_vec(G_ptr, y.data(), Gy.data(), m);
@@ -123,10 +140,7 @@ List fista_nnls_batch_cpp(const NumericMatrix& G,
         grad[i] = Gy[i] - atx[i];
         w_next[i] = y[i] - eta * grad[i];
       }
-      double sum_w_next = project_nonneg(w_next.data(), m);
-      if (sum_w_next <= 1e-12) {
-        std::fill(w_next.begin(), w_next.end(), uniform);
-      }
+      project_simplex(w_next.data(), m);
 
       mat_vec(G_ptr, w_next.data(), Gw_next.data(), m);
       double quad_next = dot_product(w_next.data(), Gw_next.data(), m);
@@ -171,11 +185,7 @@ List fista_nnls_batch_cpp(const NumericMatrix& G,
     }
 
     double sum_w = std::accumulate(w.begin(), w.end(), 0.0);
-    if (sum_w <= 1e-12) {
-      std::fill(w.begin(), w.end(), uniform);
-      mat_vec(G_ptr, w.data(), Gw.data(), m);
-      sum_w = 1.0;
-    } else {
+    if (std::abs(sum_w - 1.0) > 1e-8) {
       for (int i = 0; i < m; ++i) {
         w[i] /= sum_w;
       }
