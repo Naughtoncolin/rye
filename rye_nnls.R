@@ -12,7 +12,7 @@ script_title = "rye.R"
 
 ################################################################################
 ### Load libraries
-requiredPackages = c('nnls','Hmisc','parallel', 'optparse', 'crayon', 'Rcpp')
+requiredPackages = c('nnls','Hmisc','parallel', 'optparse', 'crayon')
 for(p in requiredPackages){
   if(!suppressMessages(require(p,character.only = TRUE, quietly = T))){
     stop(paste0("Library ", p, " is required, I can't seem to find it."))
@@ -22,9 +22,6 @@ for(p in requiredPackages){
 options(width = 220)
 options(scipen = 999)
 options(digits = 4)
-if (Sys.getenv("OMP_NUM_THREADS") == "") {
-  Sys.setenv(OMP_NUM_THREADS = 1)
-}
 
 ################################################################################
 ### Function definition
@@ -55,82 +52,6 @@ pretty_time = function(time){
   return(out_string)
 }
 
-proj_simplex = function(v) {
-  if (length(v) == 0) {
-    return(v)
-  }
-  if (any(!is.finite(v))) {
-    stop("Projection input contains non-finite values.")
-  }
-  u = sort(v, decreasing = TRUE)
-  cssv = cumsum(u)
-  rho_candidates = which(u - (cssv - 1) / seq_along(u) > 0)
-  if (!length(rho_candidates)) {
-    return(rep(1 / length(v), length(v)))
-  }
-  rho = max(rho_candidates)
-  theta = (cssv[rho] - 1) / rho
-  w = pmax(v - theta, 0)
-  total = sum(w)
-  if (total <= .Machine$double.eps) {
-    w[] = 1 / length(v)
-  } else if (abs(total - 1) > 1e-8) {
-    w = w / total
-  }
-  return(w)
-}
-
-if (!exists("fista_nnls_batch_cpp", mode = "function", inherits = TRUE)) {
-  cpp_path <- "simplex_pg.cpp"
-  if (!file.exists(cpp_path)) {
-    script_file <- NULL
-    try(script_file <- normalizePath(sys.frame(1)$ofile), silent = TRUE)
-    if (is.null(script_file)) {
-      args <- commandArgs(trailingOnly = FALSE)
-      file_arg <- grep('^--file=', args, value = TRUE)
-      if (length(file_arg)) {
-        script_file <- normalizePath(sub('^--file=', '', file_arg[1]))
-      }
-    }
-    if (!is.null(script_file) && nzchar(script_file)) {
-      cpp_path <- file.path(dirname(script_file), "simplex_pg.cpp")
-    }
-  }
-  if (!file.exists(cpp_path)) {
-    stop("Unable to locate simplex_pg.cpp for compilation")
-  }
-  Rcpp::sourceCpp(cpp_path)
-}
-
-
-solve_fista_nnls = function(G, Atx, sum_x_sq, iters = 300, eta = NULL, tol = 1e-6,
-                            warm_starts = NULL, accelerated = TRUE) {
-  if (is.null(eta)) {
-    eigenvals = eigen(G, symmetric = TRUE, only.values = TRUE)$values
-    L = max(eigenvals)
-    if (!is.finite(L) || L <= 0) {
-      L = sum(diag(G))
-      if (!is.finite(L) || L <= 0) {
-        L = 1
-      }
-    }
-    eta = 1 / L
-  }
-  if (is.null(sum_x_sq)) {
-    stop("sum_x_sq is required for FISTA solver")
-  }
-  if (!is.null(warm_starts) && !is.matrix(warm_starts)) {
-    warm_starts = as.matrix(warm_starts)
-  }
-  warm_mat = if (is.null(warm_starts)) matrix(0, 0, 0) else t(warm_starts)
-  res = fista_nnls_batch_cpp(G, Atx, sum_x_sq, iters, eta, tol, warm_mat, accelerated)
-  weights = t(res$weights)
-  attr(weights, "iterations") = as.numeric(res$iterations)
-  attr(weights, "loss") = as.numeric(res$loss)
-  attr(weights, "step_size") = eta
-  return(weights)
-}
-
 rye.scale = function(X = NULL) {
   return(apply(X, 2, function(i){i = i - min(i); i / max(i)}))
 }
@@ -157,89 +78,15 @@ rye.populationMeans = function(X = NULL, fam = NULL, alpha = NULL, weight = NULL
   return(means)
 }
 
-rye.predict = function(X = NULL, means = NULL, weight = NULL, referenceGroups = NULL,
-                       solver_iters = 300, solver_tol = 1e-6, solver_eta = NULL,
-                       warm_starts = NULL, solver_accel = TRUE,
-                       fallback_threshold = 1e-3) {
+rye.predict = function(X = NULL, means = NULL, weight = NULL, referenceGroups = NULL) {
   
-  weightedX = t(t(X) * weight)
-  if (is.null(dim(weightedX))) {
-    weightedX = matrix(weightedX, nrow = 1)
-  }
-  weightedX = as.matrix(weightedX)
-  if (!is.null(rownames(X))) {
-    rownames(weightedX) = rownames(X)
-  }
-  A = as.matrix(t(means))
-  G = crossprod(A)
-  lipschitz = NULL
-  if (is.null(solver_eta)) {
-    eigenvals = eigen(G, symmetric = TRUE, only.values = TRUE)$values
-    lipschitz = max(eigenvals)
-    if (!is.finite(lipschitz) || lipschitz <= 0) {
-      lipschitz = sum(diag(G))
-      if (!is.finite(lipschitz) || lipschitz <= 0) {
-        lipschitz = 1
-      }
-    }
-    solver_eta = 1 / lipschitz
-  } else {
-    lipschitz = 1 / solver_eta
-  }
-  n_samples = nrow(weightedX)
-  n_components = nrow(means)
-  warm_matrix = NULL
-  if (!is.null(warm_starts)) {
-    warm_matrix = as.matrix(warm_starts)
-    if (nrow(warm_matrix) != n_samples || ncol(warm_matrix) != n_components) {
-      stop("warm_starts dimension mismatch in rye.predict")
-    }
-  }
-  Atx = crossprod(A, t(weightedX))
-  sum_x_sq = rowSums(weightedX * weightedX)
-  solve_res = solve_fista_nnls(G = G, Atx = Atx, sum_x_sq = sum_x_sq,
-                               iters = solver_iters, eta = solver_eta,
-                               tol = solver_tol, warm_starts = warm_matrix,
-                               accelerated = solver_accel)
-  estimates = solve_res
-  iter_counts = attr(estimates, "iterations")
-  losses = attr(estimates, "loss")
-  dimnames(estimates) = list(rownames(weightedX), rownames(means))
-  attr(estimates, "iterations") = NULL
-  attr(estimates, "loss") = NULL
-  attr(estimates, "step_size") = NULL
-  residual_sq = 2 * losses
-
-  fallback_used = logical(n_samples)
-  if (!is.null(fallback_threshold) && any(residual_sq > fallback_threshold)) {
-    fallback_idx = which(residual_sq > fallback_threshold)
-    for (idx in fallback_idx) {
-      nnls_fit = nnls::nnls(A, weightedX[idx, ])
-      w = nnls_fit$x
-      w_sum = sum(w)
-      if (w_sum <= .Machine$double.eps) {
-        w[] = 1 / length(w)
-      } else {
-        w = w / w_sum
-      }
-      estimates[idx, ] = w
-      iter_counts[idx] = 0
-      residual_sq[idx] = nnls_fit$deviance
-      fallback_used[idx] = TRUE
-    }
-  }
-
-  raw_estimates = estimates
+  estimates = t(apply(t(t(X) * weight), 1, function(i){c = coef(nnls(A= as.matrix(t(means)), b = i)); c / sum(c)}))
+  colnames(estimates) = rownames(means)
   
   if (!is.null(referenceGroups)) {
     estimates = do.call(cbind, lapply(unique(referenceGroups), function(i) apply(estimates[ , names(referenceGroups)[referenceGroups == i], drop = FALSE], 1, sum)))
     colnames(estimates) = unique(referenceGroups)
   }
-  attr(estimates, "raw_estimates") = raw_estimates
-  attr(estimates, "solver_iterations") = iter_counts
-  attr(estimates, "solver_residual_sq") = residual_sq
-  attr(estimates, "solver_fallback") = fallback_used
-  attr(estimates, "solver_lipschitz") = lipschitz
   return(estimates)
 }
 
@@ -276,10 +123,7 @@ rye.gibbs = function(X = NULL, fam = NULL, referenceGroups = NULL,
   
   ## Get the starting error
   means = rye.populationMeans(X = X, fam = fam, alpha = alpha, weight = weight, referenceGroups = referenceGroups)[pops, ]
-  warm_starts = NULL
-  predicted = rye.predict(X = X, means = means, weight = weight, referenceGroups = referenceGroups,
-                          warm_starts = warm_starts)
-  warm_starts = attr(predicted, "raw_estimates")
+  predicted = rye.predict(X = X, means = means, weight = weight, referenceGroups = referenceGroups)
   oldError = rye.absoluteError(expected = expected, predicted = predicted)
   oldError = cbind(apply(oldError, 1, mean))
   oldError = aggregate(oldError, by = list(fam[ , 'group']), mean)
@@ -314,9 +158,7 @@ rye.gibbs = function(X = NULL, fam = NULL, referenceGroups = NULL,
     
     ## Find the new errors
     means = rye.populationMeans(X = X, fam = fam, alpha = newAlpha, weight = newWeight, referenceGroups = referenceGroups)[pops, ]
-    predicted = rye.predict(X = X, means = means, weight = newWeight, referenceGroups = referenceGroups,
-                            warm_starts = warm_starts)
-    warm_starts = attr(predicted, "raw_estimates")
+    predicted = rye.predict(X = X, means = means, weight = newWeight, referenceGroups = referenceGroups)
     newError = rye.absoluteError(expected = expected, predicted = predicted)
     newError = cbind(apply(newError, 1, mean))
     newError = aggregate(newError, by = list(fam[ , 'group']), mean)
@@ -458,7 +300,7 @@ rye = function(eigenvec_file = NULL, eigenval_file = NULL,
   referencePops = referenceGroups
   
   ## Optimize estimates using NNLS
-  logmsg("Optimizing estimates using simplex PG solver")
+  logmsg("Optimizing estimates using NNLS")
   scaledWeight = weight[seq(pcs)]
   unifAlpha = rep(0.001, length(referencePops))
   names(unifAlpha) = referencePops

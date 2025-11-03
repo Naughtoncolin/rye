@@ -1,0 +1,32 @@
+Residual mean (nnls): 0.000288
+Residual mean (fista): 0.000312
+Residual median diff: 0.000001
+Residual 95th pct diff: 0.000118
+Mean L1 distance: 0.006725
+Median L1 distance: 0.004773
+Mean L2 distance: 0.004079
+Predict time (nnls) [s]: 0.258
+Predict time (fista) [s]: 0.207
+Predict speedup: 1.25x
+Group mean abs diff:
+European 0.000885
+Asian 0.000862
+Amerindian 0.000203
+SouthAsian 0.000395
+African 0.000415
+NorthAfrican 0.000472
+Persian 0.000630
+Group European Pearson: 0.999893
+Group European Spearman: 0.995645
+Group Asian Pearson: 0.999912
+Group Asian Spearman: 0.994191
+Group Amerindian Pearson: 0.997763
+Group Amerindian Spearman: 0.987966
+Group SouthAsian Pearson: 0.999850
+Group SouthAsian Spearman: 0.988644
+Group African Pearson: 0.999993
+Group African Spearman: 0.995271
+Group NorthAfrican Pearson: 0.999893
+Group NorthAfrican Spearman: 0.993051
+Group Persian Pearson: 0.999554
+Group Persian Spearman: 0.983669
